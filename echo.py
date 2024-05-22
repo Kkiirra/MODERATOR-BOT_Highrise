@@ -3,6 +3,8 @@ from json import load, dump
 from time import time
 from math import sqrt
 
+import highrise
+from commands import CM_INSTR, MD_INST, CH_INST, WELC_INST, MOD_PARAMS, setup_commands
 import httpx
 from highrise import BaseBot, User, Position, AnchorPosition, Reaction
 from highrise.__main__ import *
@@ -15,110 +17,63 @@ import aiohttp
 
 
 class ModeratorBot(BaseBot):
+    checker: ProfanityChecker = ProfanityChecker()
+    warnings: defaultdict = defaultdict(lambda: {'count': 0, 'last_warning_time': None, 'user_id': None})
 
-    checker = ProfanityChecker()
-
-    banned_users = None
-    filter_words = None
-    ignorewords = None
-    defaultfilter = None
-    warnlimit = None
-    warnmode = None
-    set_welcome = None
-    welcome = None
-    warntime = None
-    mute_duration = None
-
-    api_key = '7bfb8522233ce607a7cae399c640e9867d4f4351bae7553b66490838a348659e'
     identifier: str = "/m "
-    warnings = defaultdict(lambda: {'count': 0, 'last_warning_time': None})
-    users: dict = {}
+    users: dict = dict()
 
-    COMMAND_INSTRUCTIONS: list[str] = [
-        "help - list all commands",
-        "welcome <on/off> - Активировать/Отключить приветствие",
-        "setwelcome <message> - Установить приветствие",
-        "ban <username> <time> - Забанить пользователя",
-        "unban <username> - Разбанить пользователя",
-        "mute <username> <lenght> - Замутить пользователя",
-        "unmute <username> - Размутить пользователя",
-        "kick <username> - Выгнать пользователя",
-        "warn <username> - Дать предупреждение",
-        "warns - Список предупреждений",
-        "resetwarn <username> - Сбросить предупреждения пользователя до 0",
-        "resetallwarn - Сбросить предупреждения всех пользователей",
-        "wanrmode <ban/kick/mute> - Функция, которая сработает после пересечения лимита предупреждений ban/kick/mute",
-        "warnlimit <integer> - Лимит предупреждений",
-        "warntime <time> - Время жизни предупреждений",
-        "defaultfilter <on/off> - Включение/Выключение базовой фильтрации",
-        "filters - Список фильтров",
-        "filter <trigger> - Добавить фильтер",
-        "ignore <word> - Слово, которое будет игнорировать фильтрацию"
-        "flood <on/off> - Функция спама включить/выключить",
-        "floodtimer <time> - Промежуток времени, чтобы сообщения считались флудом",
-        "floodmode <ban/kick/mute> - Функция, которая будет использована, если пользователь флудит"
-    ]
+    COMMAND_INSTRUCTIONS: list[str] = CM_INSTR
+    MODE_INSTANCES: list[str] = MD_INST
+    CHOICES: dict = CH_INST
+    MODER_PARAMS: list[str] = MOD_PARAMS
 
-    MODE_INSTANCES = ["mute", "kick", "ban"]
-    CHOICES = ["on", "off"]
-    USER_WELCOME_MESSAGE: str = "\nДобро пожаловать в нашу комнату. \n\n📜 Правила: /rules \n🤖 Помощь: /help"
+    USER_WELCOME_MESSAGE: str = WELC_INST
+
+    API_PLAYERS: str = "http://127.0.0.1:8000/api/bots/"
+    API_BOTS: str = "http://127.0.0.1:8000/api/bots/"
+
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.commands = setup_commands(self)
+
+    def setup_commands(self):
+        return setup_commands(self)
+
+    async def http_request(self, method, url, data=None, params=None):
+        async with httpx.AsyncClient() as client:
+            response = await client.request(method.upper(), url, json=data, params=params)
+            if response.status_code in [200, 204]:
+                return response.json() if method != 'DELETE' else response
+            else:
+                response.raise_for_status()
 
     async def before_start(self, tg: TaskGroup) -> None:
-
         moderator_params = await self.get_moderator_params()
-
-        self.welcome = moderator_params.get('welcome')
-        self.set_welcome = moderator_params.get('set_welcome')
-
-        self.mute_duration = moderator_params.get('mute_duration')
-
-        self.warnmode = moderator_params.get('warnmode')
-        self.warnlimit = moderator_params.get('warnlimit')
-        self.warntime = moderator_params.get('warntime')
-
-        self.defaultfilter = moderator_params.get('defaultfilter')
-        self.ignorewords = moderator_params.get('ignorewords')
-        self.filter_words = moderator_params.get('filter_words')
-        self.banned_users = moderator_params.get('banned')
+        for param in self.MODER_PARAMS:
+            setattr(self, param, moderator_params.get(param))
 
     async def on_user_join(self, user: User, *args, **kwargs) -> None:
         """On a user joining the room."""
         await self.create_new_user(user)
 
-        user_warnings = self.warnings.get(user.id, None)
-
+        user_warnings = self.warnings.get(user.username, None)
         if user_warnings is None:
-            self.warnings[user.id] = {'count': 0, 'last_warning_time': None, 'username': user.username}
+            self.warnings[user.username.lower()] = {'count': 0, 'last_warning_time': None, 'user_id': user.id}
 
         if self.welcome is True:
             welcome_user = f'{self.set_welcome}'
             await self.whisper_to_user(user, welcome_user)
 
-    async def on_user_leave(self, user: User) -> None:
-        """On a user leaving the room."""
-        pass
-
     async def on_chat(self, user: User, message: str) -> None:
         """On a received room-wide chat."""
-
         message = message.lower()
         response = await self.checker.check(message)
         if message.startswith(self.identifier):
             await self.handle_command(user, message.removeprefix(self.identifier))
         if response is True:
-            user_warnings = self.warnings.get(user.id, {'count': 0})
-            if user_warnings['count'] >= 3:
-                await self.highrise.moderate_room(user.id, 'mute', 10000)
-                await self.whisper_to_user(user, 'За неоднократное нарушение правил, вы получаете мут на 12 часов.')
-            else:
-                self.warnings[user.id]['username'] = user.username
-                self.warnings[user.id]['count'] += 1
-                self.warnings[user.id]['last_warning_time'] = datetime.now()
-
-                await self.highrise.send_emote('emoji-angry')
-                await self.whisper_to_user(user, f'Вы получаете предупреждение {self.warnings[user.id]["count"]}'
-                                                 f'/{self.warnlimit}.'
-                                                 f'\n\n{self.warnlimit} предупреждения мут {self.mute_duration} часов')
+            # await self.warn_user(user.username)
+            await self.warn_user(user, None)
 
     async def on_reaction(self, user: User, reaction: Reaction, receiver: User) -> None:
         """Called when someone reacts in the room."""
@@ -126,170 +81,343 @@ class ModeratorBot(BaseBot):
 
     async def handle_command(self, user: User, message: str) -> None:
         """Handler for all bot commands"""
+        bot_command, *args = message.split(maxsplit=1)
+        args = args[0] if args else ''
+        func = self.commands.get(bot_command)
+        if func:
+            await func(user, args)
+        else:
+            await self.whisper_to_user(user, "Not a valid command. Use /help to see the list of commands")
 
-        # Handle bot commands
-        match message.split(maxsplit=1):
-            case ['welcome', choice]:
-                if choice == 'off' or choice == 'on':
-                    await self.welcome_onoff(choice)
-                    await self.whisper_to_user(user, f"Функция приветствия изменена")
-                else:
-                    await self.whisper_to_user(user, f"Выберите между /m welcome off или /m welcome on")
+    async def welcome_onoff(self, user: User, choice: str, response: httpx.Response = None) -> None:
+        if choice in self.CHOICES:
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "welcome": self.CHOICES[choice]
+                    }
+                )
+            except httpx.HTTPStatusError:
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время изменения")
 
-            case ['setwelcome', message]:
-                await self.set_welcome_message(message)
-                await self.whisper_to_user(user, f"Приветствие изменено")
+            if response:
+                await self.whisper_to_user(user, f"Функция приветствия изменена")
+                self.welcome = response.get('welcome')
+            else:
+                await self.whisper_to_user(user, f"ServerError: Ошибка во время отправки запроса")
 
-            case ['ban', username_lenght]:
-                try:
-                    username, lenght = username_lenght.split()
-                    await self.ban_user(username, int(lenght))
-                except ValueError:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m ban username 10000")
+        else:
+            await self.whisper_to_user(user, f"Выберите между on/off")
 
-            case ['unban', username]:
-                try:
-                    await self.unban_user(username)
-                except ValueError:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m unmute username")
+    async def set_welcome_message(self, user: User, message: str, response: httpx.Response = None) -> None:
+        try:
+            response = await self.http_request(
+                method='PUT', url=self.API_BOTS,
+                data={
+                    "api_key": self.api_key,
+                    "set_welcome": message
+                }
+            )
+        except (httpx.HTTPStatusError, httpx.WriteError):
+            await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
 
-            case ['mute', username_lenght]:
-                try:
-                    username, lenght = username_lenght.split()
-                    await self.mute_user(username, int(lenght))
-                except ValueError:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m mute username 10000")
+        if response:
+            await self.whisper_to_user(user, f"Приветствие изменено")
+            self.set_welcome = response.get('set_welcome')
 
-            case ['unmute', username]:
-                try:
-                    await self.unmute_user(username)
-                except ValueError:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m unmute username")
+    async def ban_user(self, user: User, username_lenght: str) -> None:
 
-            case ['kick', username]:
-                try:
-                    await self.kick_user(username)
-                except ValueError:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m kick username")
-            case ['warn', username_reason]:
+        try:
+            username, lenght = username_lenght.split(maxsplit=1)
+        except ValueError:
+            await self.whisper_to_user(user, f"ValueError: Ошибка, пример /m ban Kkiirra2 10")
+            return
+
+        if lenght.isdigit():
+            # user_id = await self.get_user(username)
+            user_id = self.warnings[username]['user_id']
+            try:
+                await self.highrise.moderate_room(user_id, 'ban', int(lenght) * 3600)
+            except highrise.ResponseError:
+                await self.whisper_to_user(user, f"Пользователь не найден.")
+                return
+            await self.whisper_to_user(user, f"Пользователь {username} забанен на {lenght} часов")
+        else:
+            await self.whisper_to_user(user, f"ValueError: Ошибка, пример /m ban Kkiirra2 10")
+
+    async def unban_user(self, user: User, username) -> None:
+
+        user_id = await self.get_user(username)
+
+        try:
+            await self.highrise.moderate_room(user_id, 'unban')
+        except highrise.ResponseError:
+            await self.whisper_to_user(user, f"Пользователь не найден.")
+            return
+        await self.whisper_to_user(user, f"Пользователь {username} разбанен")
+
+    async def mute_user(self, user: User, username_lenght: str) -> None:
+
+        try:
+            username, lenght = username_lenght.split(maxsplit=1)
+        except ValueError:
+            await self.whisper_to_user(user, f"ValueError: Ошибка, пример /m mute Kkiirra2 10")
+            return
+
+        if lenght.isdigit():
+            # user_id = await self.get_user(username)
+            user_id = self.warnings.get(username).get('user_id')
+
+            try:
+                await self.highrise.moderate_room(user_id, 'mute', int(lenght) * 3600)
+            except highrise.ResponseError:
+                await self.whisper_to_user(user, f"Пользователь не найден.")
+                return
+
+            await self.whisper_to_user(user, f"Пользователь {username} заглушен на {lenght} часов")
+            await self.highrise.send_whisper(user_id, f'Вы получили мут на 10 часов от {user.username}')
+        else:
+            await self.whisper_to_user(user, f"ValueError: Ошибка, пример /m mute Kkiirra2 10")
+
+    async def unmute_user(self, user: User, username) -> None:
+
+        # user_id = await self.get_user(username)
+        user_id = self.warnings.get(username).get('user_id')
+
+        try:
+            await self.highrise.moderate_room(user_id, 'mute', 1)
+        except highrise.ResponseError:
+            await self.whisper_to_user(user, f"Пользователь не найден.")
+            return
+
+        await self.whisper_to_user(user, f"Пользователь {username} размучен")
+        await self.highrise.send_whisper(user_id, f'Вы получили размут от {user.username}')
+
+    async def kick_user(self, user: User, username: str) -> None:
+
+        # user_id = await self.get_user(username)
+        user_id = self.warnings.get(username).get('user_id')
+
+        try:
+            await self.highrise.moderate_room(user_id, 'kick')
+        except highrise.ResponseError:
+            await self.whisper_to_user(user, f"Пользователь не найден.")
+            return
+        await self.whisper_to_user(user, f"Пользователь {username} выгнан из комнаты.")
+
+    async def warn_user(self, user: User, username_reason: str | None) -> None:
+
+        if username_reason is None:
+            username = user.username
+            reason = 'Нецензурная брань.'
+            user_id = user.id
+        else:
+            try:
                 username, reason = username_reason.split(maxsplit=1)
-                user_id = await self.get_user(username)
+            except ValueError:
+                await self.whisper_to_user(user, f"ValueError: Ошибка, пример /m warn Kkiirra2 Нецензурная брань")
+                return
+            user_id = self.warnings.get(username).get('user_id')
+        username = username.lower()
 
-                self.warnings[user_id]['count'] += 1
-                self.warnings[user_id]['last_warning_time'] = datetime.now()
+        self.warnings.setdefault(username, {'count': 0, 'last_warning_time': datetime.now(),
+                                            'user_id': user_id})['count'] += 1
 
-                await self.highrise.send_whisper(user_id, f"Вы получаете предупреждение "
-                                                          f"{self.warnings[user_id]['count']}/{self.warnlimit} "
-                                                          f"\n\nПо причине: {reason}")
-            case ['warns']:
-                users_warnings = str()
-                if self.warnings.values():
-                    for data in self.warnings.values():
-                        users_warnings += f"\nUsername: {data.get('username')} Count: {data.get('count')}"
-                    await self.whisper_to_user(user, users_warnings)
-                else:
-                    await self.whisper_to_user(user, 'Нету активных предупреждений')
-            case ['resetwarn', username]:
-                user_id = await self.get_user(username)
-                self.warnings[user_id]['count'] = 0
-                await self.whisper_to_user(user, f"Предупреждения для {username} сброшены")
-            case ['resetallwarn']:
-                self.warnings = defaultdict(lambda: {'count': 0, 'last_warning_time': None})
-                await self.whisper_to_user(user, f"Предупреждения сброшены")
-            case ['warnmode', mode]:
-                if mode in self.MODE_INSTANCES:
-                    responce = await self.change_warnmode(mode)
-                    if responce.status_code == 200:
-                        await self.whisper_to_user(user, f"Warn mode успешно изменён на {mode}")
-                    else:
-                        await self.whisper_to_user(user, f"Ошибка при изменении")
-                else:
-                    await self.whisper_to_user(user, f"Выберите между <ban/kick/mute>")
+        await self.highrise.send_whisper(user_id, f"Вы получаете предупреждение "
+                                                  f"{self.warnings[username]['count']}/{self.warnlimit} "
+                                                  f"\n\nПо причине: {reason}"
+                                                  f"\n\nПосле {self.warnlimit} предупреждений {self.warnmode} "
+                                                  f"на {self.mute_duration} часа")
 
-            case ['warnlimit', warnlimit]:
-                if warnlimit.isdigit():
-                    response = await self.change_limit(int(warnlimit))
-                    if response == 200:
-                        await self.whisper_to_user(user, f"Warn limit успешно изменён на {warnlimit}")
-                    else:
-                        await self.whisper_to_user(user, f"Ошибка при изменении")
-                else:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m warnlimit 10")
-            case ['defaultfilter', choice]:
-                if choice in self.CHOICES:
-                    response = await self.change_defaultfilter(choice)
-                    if response == 200:
-                        await self.whisper_to_user(user, f"Default filter {choice}")
-                    else:
-                        await self.whisper_to_user(user, f"Ошибка при изменении")
-                else:
-                    await self.whisper_to_user(user, f"Ошибка, пример /m defaultfilter on")
+        await self.highrise.send_emote('emoji-angry')
 
-            case ['filters']:
-                await self.whisper_to_user(user, f"Filters: {self.filter_words}")
-            case ['filter', trigger]:
-                response = await self.add_filter(trigger)
-                if response == 200:
-                    await self.whisper_to_user(user, 'Фильтр успешно добавлен')
-                else:
-                    await self.whisper_to_user(user, 'Ошибка при добавлении фильтра')
-            case ['dfilter', trigger]:
-                response = await self.delete_filter(trigger)
-                if response == 204 or response == 200:
-                    await self.whisper_to_user(user, 'Фильтр успешно удалён')
-                    await self.remove_word_from_string('filter_words', trigger)
-                else:
-                    await self.whisper_to_user(user, 'Ошибка при удалении фильтра')
-            case ['ignorewords']:
-                await self.whisper_to_user(user, f"Ingored Word: {self.ignorewords}")
-            case ['ignore', trigger]:
-                response = await self.add_ignore(trigger)
-                if response == 200:
-                    await self.whisper_to_user(user, 'Ignore успешно добавлен')
-                else:
-                    await self.whisper_to_user(user, 'Ошибка при добавлении ignore')
-            case ['dignore', trigger]:
-                response = await self.delete_filter(trigger)
-                if response == 204 or response == 200:
-                    await self.whisper_to_user(user, 'Игнор успешно удалён')
-                    await self.remove_word_from_string('ignorewords', trigger)
-                else:
-                    await self.whisper_to_user(user, 'Ошибка при удалении игнора')
-            case 'help':
-                await self.whisper_to_user(user, "\n" + "\n".join(self.COMMAND_INSTRUCTIONS))
+        if self.warnings[username]['count'] >= self.warnlimit:
+            self.warnings[username]['count'] = 0
+            try:
+                if self.warnmode == 'kick':
+                    await self.highrise.moderate_room(user_id, self.warnmode)
+                elif self.warnmode == 'mute' or self.warnmode == 'ban':
+                    await self.highrise.send_whisper(user_id, f'За неоднократное нарушение правил, '
+                                                              f'вы получаете {self.warnmode} на '
+                                                              f'{self.mute_duration} часов.')
+                    await self.highrise.moderate_room(user_id, self.warnmode, self.mute_duration * 3600)
 
-            case _:
-                await self.whisper_to_user(user, f"Not a valid command. Use {self.identifier}help to see the list of commands")
+                    await self.highrise.moderate_room(user_id, self.warnmode, self.mute_duration * 3600)
+            except highrise.ResponseError:
+                await self.whisper_to_user(user, 'Я не могу модерировать модераторов.')
 
+    async def show_warnings(self, user: User, args: str):
+        users_warnings = str()
+        if self.warnings.values():
+            for username, data in self.warnings.items():
+                users_warnings += f"\nUsername: {username} Count: {data.get('count')}"
+            await self.whisper_to_user(user, users_warnings)
+        else:
+            await self.whisper_to_user(user, 'Нету активных предупреждений')
+
+    async def reset_warning(self, user: User, username: str):
+        self.warnings[username]['count'] = 0
+        await self.whisper_to_user(user, f"Предупреждения для {username} сброшены.")
+
+    async def reset_all_warnings(self, user: User, args: str):
+        for username in self.warnings.keys():
+            self.warnings[username]['count'] = 0
+        await self.whisper_to_user(user, f"Предупреждения для всех пользователей сброшены.")
+
+    async def change_warnmode(self, user: User, warnmode: str, response: httpx.Response = None) -> None:
+        if warnmode in self.MODE_INSTANCES:
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "warnmode": warnmode
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Варн мод изменён")
+                self.warnmode = response.get('warnmode')
+        else:
+            await self.whisper_to_user(user, f"Выберите между <ban/kick/mute>")
+
+    async def change_warnlimit(self, user: User, warnlimit: str, response: httpx.Response = None) -> None:
+        if warnlimit.isdigit():
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "warnlimit": warnlimit
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Лимит предупреждений изменён")
+                self.warnmode = response.get('warnlimit')
+        else:
+            await self.whisper_to_user(user, f"Неправильный ввод. \nПример: /m warnlimit 5")
+
+    async def change_defaultfilter(self, user: User, choice: str, response: httpx.Response = None) -> None:
+        if choice in self.CHOICES:
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "defaultfilter": self.CHOICES[choice]
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Фильтр по умолчанию {choice}")
+                self.warnmode = response.get('warnlimit')
+        else:
+            await self.whisper_to_user(user, f"Неправильный ввод. \nПример: /m defaultfilter <on/off>")
+
+    async def list_filters(self, user: User, args: str, response: httpx.Response = None) -> None:
+        await self.whisper_to_user(user, f"Filters: {self.filter_words}")
+
+    async def add_filter(self, user: User, trigger: str, response: httpx.Response = None) -> None:
+        if trigger:
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "filter_words": trigger
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Добавлен новый фильтр {trigger}")
+                self.filter_words = response.get('filter_words')
+        else:
+            await self.whisper_to_user(user, f"Ошибка. \nПример /m filter плохое слово.")
+
+    async def delete_filter(self, user: User, trigger: str, response: httpx.Response = None) -> None:
+        if trigger:
+            try:
+                response = await self.http_request(
+                    method='DELETE', url=self.API_BOTS,
+                    params={
+                        "api_key": self.api_key,
+                        "word": trigger,
+                        "field": "filter_words"
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Фильтр {trigger} удалён")
+                await self.remove_word_from_string('filter_words', trigger)
+        else:
+            await self.whisper_to_user(user, f"Ошибка. \nПример /m dfilter плохое слово")
+
+    async def ignore_words(self, user: User, args: str, response: httpx.Response = None) -> None:
+        await self.whisper_to_user(user, f"Ignore words list: {self.ignorewords}")
+
+    async def add_ignore(self, user: User, trigger: str, response: httpx.Response = None) -> None:
+        if trigger:
+            try:
+                response = await self.http_request(
+                    method='PUT', url=self.API_BOTS,
+                    data={
+                        "api_key": self.api_key,
+                        "ignorewords": trigger
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Добавлен новый игнор {trigger}")
+                self.ignorewords = response.get('ignorewords')
+        else:
+            await self.whisper_to_user(user, f"Ошибка. \nПример /m ignore слово.")
+
+    async def delete_ignore(self, user: User, trigger: str, response: httpx.Response = None) -> None:
+        if trigger:
+            try:
+                response = await self.http_request(
+                    method='DELETE', url=self.API_BOTS,
+                    params={
+                        "api_key": self.api_key,
+                        "word": trigger,
+                        "field": "ignorewords"
+                    }
+                )
+            except (httpx.HTTPStatusError, httpx.WriteError):
+                await self.whisper_to_user(user, f"HTTPStatusError: Ошибка во время отправки запроса")
+
+            if response:
+                await self.whisper_to_user(user, f"Игнор {trigger} удалён")
+                await self.remove_word_from_string('ignorewords', trigger)
+        else:
+            await self.whisper_to_user(user, f"Ошибка. \nПример /m dignore плохое слово")
+
+    async def show_help(self, user: User, args: str):
+        help_message = ' '.join(self.COMMAND_INSTRUCTIONS)
+        max_length = 200
+
+        for i in range(0, len(help_message), max_length):
+            await self.whisper_to_user(user, help_message[i:i + max_length])
+            a = await self.highrise.get_conversations()
 
     async def whisper_to_user(self, user: User, message: str) -> None:
         """Whispers a message to a user."""
         await self.highrise.send_whisper(user.id, message)
-
-    async def check_and_warn_user(self, user_id):
-        now = datetime.now()
-
-        # Получаем предупреждения пользователя из словаря
-        user_warnings = self.warnings.get(user_id, None)
-
-        if user_warnings is None:
-            self.warnings[user_id] = {'count': 0, 'last_warning_time': None}
-
-        # Проверяем, прошло ли уже 24 часа с последнего предупреждения
-        if user_warnings['last_warning_time'] is not None:
-            time_since_last_warning = now - user_warnings['last_warning_time']
-            if time_since_last_warning >= timedelta(hours=24):
-                user_warnings['count'] = 0  # Сбрасываем количество предупреждений, если прошло больше 24 часов
-
-        # Увеличиваем количество предупреждений пользователя
-        user_warnings['count'] += 1
-        user_warnings['last_warning_time'] = now
-
-        # Проверяем, достиг ли пользователь трех предупреждений
-        if user_warnings['count'] >= 3:
-            # Применяем мут на час и сбрасываем количество предупреждений
-            user_warnings['count'] = 0
-            return True
 
     async def create_new_user(self, user: User) -> httpx.Response:
         """Retrieves and returns the weather data based on provided location"""
@@ -309,187 +437,9 @@ class ModeratorBot(BaseBot):
             response = await client.post(f"http://127.0.0.1:8000/api/bots/", data=data)
             return response.json()
 
-    async def welcome_onoff(self, welcome_choice: str) -> httpx.Response:
-        """Retrieves and returns the weather data based on provided location"""
-        async with httpx.AsyncClient() as client:
-            if welcome_choice.lower() == "on":
-                welcome_choice = True
-            else:
-                welcome_choice = False
-
-            data = {
-                "api_key": self.api_key,
-                "welcome": welcome_choice
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-            if response.status_code == 200:
-                welcome = response.json().get("welcome")
-                self.welcome = welcome
-
-            return response
-
-    async def set_welcome_message(self, message: str) -> httpx.Response:
-        """Retrieves and returns the weather data based on provided location"""
-        async with httpx.AsyncClient() as client:
-            data = {
-                "api_key": self.api_key,
-                "set_welcome": message
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                set_welcome = response.json().get("set_welcome")
-                self.set_welcome = set_welcome
-
-            return response
-
-    async def ban_user(self, username: str, lenght: int):
-        """Retrieves and returns the weather data based on provided location"""
-        user_id = await self.get_user(username)
-        await self.highrise.moderate_room(user_id, 'ban', lenght)
-
-    async def unban_user(self, username: str):
-        """Retrieves and returns the weather data based on provided location"""
-        user_id = await self.get_user(username)
-        await self.highrise.moderate_room(user_id, 'unban')
-
-    async def mute_user(self, username: str, lenght: int):
-        """Retrieves and returns the weather data based on provided location"""
-        user_id = await self.get_user(username)
-        await self.highrise.moderate_room(user_id, 'mute', lenght)
-
-    async def unmute_user(self, username: str):
-        """Retrieves and returns the weather data based on provided location"""
-        user_id = await self.get_user(username)
-        await self.highrise.moderate_room(user_id, 'mute', 1)
-
-    async def kick_user(self, username: str):
-        """Retrieves and returns the weather data based on provided location"""
-        user_id = await self.get_user(username)
-        await self.highrise.moderate_room(user_id, 'kick', )
-
-    async def change_warnmode(self, mode: str):
-        async with httpx.AsyncClient() as client:
-            data = {
-                "api_key": self.api_key,
-                "warnmode": mode
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                warnmode = response.json().get("warnmode")
-                self.warnmode = warnmode
-
-            return response
-
-    async def change_limit(self, warnlimit: int):
-        async with httpx.AsyncClient() as client:
-            data = {
-                "api_key": self.api_key,
-                "warnlimit": warnlimit
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                warnlimit = response.json().get("warnlimit")
-                self.warnlimit = warnlimit
-
-            return response.status_code
-
-    async def change_defaultfilter(self, choice: str):
-        async with httpx.AsyncClient() as client:
-
-            if choice == "on":
-                defaultfilter = True
-            else:
-                defaultfilter = False
-
-            data = {
-                "api_key": self.api_key,
-                "defaultfilter": defaultfilter
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                defaultfilter = response.json().get("defaultfilter")
-                self.defaultfilter = defaultfilter
-
-            return response.status_code
-
-    async def add_filter(self, trigger: str):
-        async with httpx.AsyncClient() as client:
-
-            data = {
-                "api_key": self.api_key,
-                "filter_words": trigger,
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                filter_words = response.json().get("filter_words")
-                self.filter_words = filter_words
-
-            return response.status_code
-
-    async def delete_filter(self, trigger: str):
-        async with httpx.AsyncClient() as client:
-
-            params = {
-                "api_key": self.api_key,
-                "word": trigger,
-                "field": "filter_words"
-            }
-
-            response = await client.delete(f"http://127.0.0.1:8000/api/bots/", params=params)
-
-            if response.status_code == 200:
-                filter_words = response.json().get("filter_words")
-                self.filter_words = filter_words
-
-            return response.status_code
-
-    async def add_ignore(self, trigger: str):
-        async with httpx.AsyncClient() as client:
-
-            data = {
-                "api_key": self.api_key,
-                "ignorewords": trigger,
-            }
-
-            response = await client.put(f"http://127.0.0.1:8000/api/bots/", data=data)
-
-            if response.status_code == 200:
-                ignorewords = response.json().get("ignorewords")
-                self.ignorewords = ignorewords
-
-            return response.status_code
-
-    async def delete_ignore(self, trigger: str):
-        async with httpx.AsyncClient() as client:
-
-            params = {
-                "api_key": self.api_key,
-                "word": trigger,
-                "field": "ignorewords"
-            }
-
-            response = await client.delete(f"http://127.0.0.1:8000/api/bots/", params=params)
-
-            if response.status_code == 200:
-                filter_words = response.json().get("ignorewords")
-                self.filter_words = filter_words
-
-            return response.status_code
-
     async def get_user(self, username):
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"https://webapi.highrise.game/users?username={username}",)
+            response = await client.get(f"https://webapi.highrise.game/users?username={username}", )
             if response.status_code == 200:
                 try:
                     user_id = response.json().get('users')[0].get('user_id')
@@ -506,8 +456,8 @@ class ModeratorBot(BaseBot):
             self.filter_words = ' '.join([word for word in words if word != word_to_remove])
 
 
-room_id = '653a204cd2ba9c946594d95d'
-api_key = '7bfb8522233ce607a7cae399c640e9867d4f4351bae7553b66490838a348659e'
+room_id = ''
+bot_api_key = ''
 
 if __name__ == "__main__":
     while True:
@@ -515,9 +465,9 @@ if __name__ == "__main__":
             arun(main(
                 [
                     BotDefinition(
-                        ModeratorBot(),
+                        ModeratorBot(bot_api_key),
                         room_id,
-                        api_key)
+                        bot_api_key)
                 ]
             )
             )
